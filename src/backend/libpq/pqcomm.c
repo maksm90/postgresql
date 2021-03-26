@@ -59,6 +59,9 @@
 #include <grp.h>
 #include <unistd.h>
 #include <sys/file.h>
+#ifdef HAVE_POLL_H
+#include <sys/poll.h>
+#endif
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -104,6 +107,7 @@
  */
 int			Unix_socket_permissions;
 char	   *Unix_socket_group;
+int         client_connection_check_interval;
 
 /* Where the Unix socket files are (list of palloc'd strings) */
 static List *sock_paths = NIL;
@@ -919,13 +923,13 @@ socket_set_nonblocking(bool nonblocking)
 }
 
 /* --------------------------------
- *		pq_recvbuf - load some bytes into the input buffer
+ *		pq_recvbuf_ext - load some bytes into the input buffer
  *
  *		returns 0 if OK, EOF if trouble
  * --------------------------------
  */
 static int
-pq_recvbuf(void)
+pq_recvbuf_ext(bool nonblocking)
 {
 	if (PqRecvPointer > 0)
 	{
@@ -941,8 +945,7 @@ pq_recvbuf(void)
 			PqRecvLength = PqRecvPointer = 0;
 	}
 
-	/* Ensure that we're in blocking mode */
-	socket_set_nonblocking(false);
+	socket_set_nonblocking(nonblocking);
 
 	/* Can fill buffer from PqRecvLength and upwards */
 	for (;;)
@@ -954,6 +957,9 @@ pq_recvbuf(void)
 
 		if (r < 0)
 		{
+			if (nonblocking && (errno == EAGAIN || errno == EWOULDBLOCK))
+				return 0;
+
 			if (errno == EINTR)
 				continue;		/* Ok if interrupted */
 
@@ -980,6 +986,13 @@ pq_recvbuf(void)
 		return 0;
 	}
 }
+
+static int
+pq_recvbuf(void)
+{
+	return pq_recvbuf_ext(false);
+}
+
 
 /* --------------------------------
  *		pq_getbyte	- get a single byte from connection, or return EOF
@@ -1920,4 +1933,46 @@ pq_settcpusertimeout(int timeout, Port *port)
 #endif
 
 	return STATUS_OK;
+}
+
+/*
+ * POLLRDHUP is a Linux extension to poll(2).  Unlike POLLHUP, it has to be
+ * requested explicitly.  It detects half-shutdown sockets, which are not
+ * always reported as POLLHUP on Linux, depending on the type of socket.  We'll
+ * look out for both.
+ */
+#ifdef POLLRDHUP
+#define PG_POLLRDHUP POLLRDHUP
+#else
+#define PG_POLLRDHUP 0
+#endif
+
+/*
+ * Check if the client is still connected.
+ */
+bool
+pq_check_connection(void)
+{
+#if defined(HAVE_POLL) || defined(WIN32)
+	struct pollfd pollfd;
+	int			rc;
+
+	pollfd.fd = MyProcPort->sock;
+	pollfd.events = POLLOUT | POLLIN | PG_POLLRDHUP;
+	pollfd.revents = 0;
+#ifdef WIN32
+	rc = WSAPoll(&pollfd, 1, 0);
+#else
+	rc = poll(&pollfd, 1, 0);
+#endif
+	if (rc < 0)
+	{
+		elog(COMMERROR, "could not poll socket: %m");
+		return false;
+	}
+	else if (rc == 1 && (pollfd.revents & (POLLHUP | PG_POLLRDHUP)))
+		return false;
+#endif
+
+	return true;
 }
